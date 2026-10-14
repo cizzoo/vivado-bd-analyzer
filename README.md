@@ -39,8 +39,9 @@ flowchart LR
 
 ## Safety: read-only by design
 
-The skill writes to **exactly one folder**, the *work directory* you choose (e.g. `~/bdq/<project>`),
-which holds `bdq.json`, the exported graphs and the notes.
+The skill writes to **one folder**, the *work directory* you choose (e.g. `~/bdq/<project>`),
+which holds `bdq.json`, the exported graphs and the notes, plus a small registry,
+`~/.config/bdq/projects.json`, that maps each project to its work directory.
 
 - **In code:** every write by `bdq` is refused outside the work directory, and inside the project
   if the work directory contains it.
@@ -75,8 +76,7 @@ From a clone, copy the skill folder instead:
 `cp -r vivado-bd-analyzer/vivado-bd-analyzer ~/.claude/skills/`. Then restart Claude Code.
 
 Optional: `alias bdq="python3 ~/.claude/skills/vivado-bd-analyzer/scripts/bdq.py"` to run the CLI
-yourself, `export BDQ_CONFIG=~/bdq/<project>/bdq.json` so every session finds your configuration,
-and copy `assets/hdl-reader.md` to `~/.claude/agents/` to install the subagent for large reads.
+yourself, and copy `assets/hdl-reader.md` to `~/.claude/agents/` to install the subagent for large reads.
 
 ## Quick start
 
@@ -103,7 +103,9 @@ bdq --config ~/bdq/proj/bdq.json overview
 ## Configuration
 
 Everything lives in the work directory: `bdq.json`, one graph per block design under `graphs/`,
-one notes file per profile, and a source index cache under `.cache/`. Values resolve as
+one notes file per profile, and a source index cache under `.cache/`. The first `export --save`
+registers the project in `~/.config/bdq/projects.json`, so later runs inside the project find the
+configuration without `--config`. Values resolve as
 **command-line flags > active profile > top-level fields**, and a profile (usually one per block
 design) only needs the fields that differ. `bdq config` shows what is active.
 
@@ -142,7 +144,7 @@ The full `bdq` reference is in [CLI.md](CLI.md). The graph schema and export int
 | Symptom | Likely cause / fix |
 |---|---|
 | `bdq: command not found` | It is a script: use `python3 …/scripts/bdq.py` or define the alias |
-| `no work directory: pass --workdir DIR` | First setup: pass `--workdir` (and `--project-root`), or set `BDQ_CONFIG` |
+| `no configuration found for …` | First setup: pass `--workdir` and `--project-root` to the first `export --save`. An existing setup: `bdq --config <dir>/bdq.json config --register` |
 | `refusing to write outside the work directory` | `--out` or the configuration points outside the work directory |
 | `refusing to write inside the project` | The work directory is the project root or contains it: move `bdq.json` to a dedicated folder and set `project_root` |
 | `vivado: command not found` | Set `vivado.settings` to your `settings64.sh` |

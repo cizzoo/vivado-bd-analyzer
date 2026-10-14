@@ -1,7 +1,7 @@
 # Design notes
 
-Short, versioned explanations of BD blocks, kept in the work directory. Maintained by Claude via
-`bdq notes NAME --template`. Source paths are relative to the project root.
+Short, versioned explanations of BD blocks, kept in the work directory. Written by Claude via
+`bdq notes NAME --set`, which generates each header and sources line. Source paths are relative to the project root.
 A note is "fresh" while the sha1 in its sources line matches the file on disk.
 
 ## /hdr_switch

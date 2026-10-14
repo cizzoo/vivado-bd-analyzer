@@ -144,16 +144,29 @@ stream types.
 
 ## Notes
 
-**`notes [NAME] [--template]`** lists notes and their freshness, prints one note, or prints a
-template for a new note with the current sha1 of its sources. If the notes file already has a
-section for that block, `--template` says so on stderr: replace that section instead of appending.
+**`notes [NAME] [--template | --set] [--source FILE]`** lists notes and their freshness, prints one
+note, prints a template for a new note, or writes one.
+
+`notes NAME --set` reads the note body (a `Role:` line plus bullets) from stdin and writes the
+section for that block in the notes file: it generates the `## /path` header and the
+`<!-- sources: file@sha1 -->` line from the block's current source, replaces any existing section
+for the block (removing duplicates), and refuses a body without a `Role:` line. `--source FILE`
+(repeatable, relative to the project root) adds other files the note depends on to its sources.
+
+```text
+$ bdq notes hdr_switch --set <<'EOF'
+Role: header-based switch, routes each packet to pe_0/pe_1
+- Verified: output select = s_axis_tdata[8 +: SEL_W] (src/rtl/hdr_switch.sv:36-38)
+EOF
+note added: hdr_switch in workdir:design_notes_pkt_proc.md  (sources: src/rtl/hdr_switch.sv@4fd0cbe513)
+```
 
 ## Setup and export
 
 | Command | Meaning |
 |---|---|
 | `discover [--max-depth N]` | Candidate `.xpr` and `.bd` files in the project, graphs in the work directory, profiles |
-| `config` | Effective configuration: work directory, project, profile, Vivado parameters, graph and notes paths |
+| `config [--register \| --unregister]` | Effective configuration: work directory, project, profile, Vivado parameters, graph and notes paths, registry status. `--register` maps this project to this `bdq.json` |
 | `export [options]` | Run the export (see below) |
 
 `export` options:
@@ -175,8 +188,8 @@ Vivado). The first saved profile becomes the default.
 ## Configuration file
 
 `bdq` finds `bdq.json` in this order: `--config PATH`, `--workdir DIR` (uses `DIR/bdq.json`), the
-`BDQ_CONFIG` environment variable, then a search upwards from the current directory. The work
-directory is the folder that holds it:
+`BDQ_CONFIG` environment variable, the **project registry**, then a search upwards from the current
+directory. The work directory is the folder that holds it:
 
 ```text
 ~/bdq/proj/                      # the work directory: the ONLY writable place
@@ -185,6 +198,12 @@ directory is the folder that holds it:
 ├── design_notes_pkt_proc.md     # notes, one file per profile
 └── .cache/src_index.json        # which file declares which module/function (rebuilt as needed)
 ```
+
+The registry, `~/.config/bdq/projects.json` (`$XDG_CONFIG_HOME/bdq/` if set, or `BDQ_REGISTRY`),
+maps project roots to their `bdq.json`. bdq looks up the current directory (or `--project-root`)
+and picks the innermost registered project containing it. `export --save` registers the project;
+`config --register` / `config --unregister` add or remove an existing setup, and `bdq config`
+shows whether the project is registered. It is the only file bdq writes outside a work directory.
 
 Values resolve as command-line flags > active profile (`--profile`, `BDQ_PROFILE`,
 `default_profile`) > top-level fields. A complete example is in
@@ -216,7 +235,7 @@ bdq --workdir ~/bdq/proj --project-root ~/work/proj \
 bdq --workdir ~/bdq/proj --project-root ~/work/proj \
     export --xpr proj.xpr --bd pkt_proc --src-root src/rtl --save
 
-# Day to day (with BDQ_CONFIG set, or pass --config ~/bdq/proj/bdq.json)
+# Day to day, from inside the project (registered by the first --save)
 bdq overview
 bdq block hdr_switch
 bdq path S_AXIS_ETH M_AXIS_QDMA
@@ -230,6 +249,6 @@ bdq export --bd dbg_bd --save debug
 bdq --profile debug overview
 
 # Record what you learned about a block
-bdq notes hdr_switch --template >> ~/bdq/proj/design_notes_pkt_proc.md   # then edit Role / bullets
+printf 'Role: header-based switch\n' | bdq notes hdr_switch --set
 bdq notes
 ```

@@ -15,9 +15,9 @@ Commands:
   addr [FILTER]                   address map segments
   src NAME                        where the block's source lives (+ sha1)
   outline NAME [--max N]          structural outline of the source, no bodies
-  notes [NAME] [--template]       cached explanations and their freshness
+  notes [NAME] [--template|--set] cached explanations and their freshness; --set writes one
   export [--dry-run] [--bd ..]    (re)generate bd_graph.json with the local Vivado
-  config                          show the effective configuration and profiles
+  config [--register]             show the effective configuration and profiles
   discover                        list .xpr / .bd candidates and existing graphs
 """
 from __future__ import annotations
@@ -50,6 +50,7 @@ MAX_FILE_BYTES = 5_000_000
 GRAPH_SCHEMA = 1                      # meta.schema written by bd_export.tcl; absent means 0
 SRC_INDEX = ".cache/src_index.json"   # source index, in the work directory
 DEFAULT_EXPORT_TIMEOUT = 3600         # seconds
+REGISTRY_VERSION = 1
 
 
 # ---------------------------------------------------------------- helpers ----
@@ -111,6 +112,68 @@ def width(pin: dict) -> str:
     return ""
 
 
+# --------------------------------------------------------------- registry ----
+def registry_path() -> Path:
+    """Project root -> bdq.json map, so that bdq finds a project's configuration by itself.
+    The only file bdq writes outside a work directory; it holds paths and nothing else."""
+    if os.environ.get("BDQ_REGISTRY"):
+        return Path(os.environ["BDQ_REGISTRY"]).expanduser()
+    base = os.environ.get("XDG_CONFIG_HOME") or "~/.config"
+    return Path(base).expanduser() / "bdq" / "projects.json"
+
+
+def load_registry() -> dict:
+    """{project_root: config_file}; an unreadable registry is treated as empty."""
+    try:
+        data = json.loads(registry_path().read_text())
+        projects = data.get("projects") if isinstance(data, dict) else None
+        return {k: v for k, v in (projects or {}).items() if isinstance(k, str) and isinstance(v, str)}
+    except (OSError, ValueError):
+        return {}
+
+
+def registry_lookup(start: Path):
+    """(project_root, config_file) of the registered project containing start, innermost first."""
+    start = start.resolve()
+    best = None
+    for root, cfg in load_registry().items():
+        r = Path(root)
+        if (r == start or r in start.parents) and Path(cfg).is_file():
+            if best is None or len(r.parts) > len(Path(best[0]).parts):
+                best = (root, cfg)
+    return best
+
+
+def registry_set(root: Path, cfg_file) -> None:
+    """Map root to cfg_file (None removes the entry). Atomic; never writes anywhere else."""
+    path = registry_path()
+    projects = load_registry()
+    key = str(root.resolve())
+    old = projects.get(key)
+    if cfg_file is None:
+        if key not in projects:
+            print(f"registry: {key} was not registered")
+            return
+        del projects[key]
+    else:
+        projects[key] = str(Path(cfg_file).resolve())
+        if old == projects[key]:
+            return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps({"version": REGISTRY_VERSION, "projects": dict(sorted(projects.items()))},
+                                  indent=2) + "\n")
+        tmp.replace(path)
+    except OSError as e:
+        print(f"bdq: could not update the registry {path}: {e.strerror}", file=sys.stderr)
+        return
+    if cfg_file is None:
+        print(f"registry: removed {key}")
+    else:
+        print(f"registry: {key} -> {projects[key]}" + (f" (was {old})" if old else ""))
+
+
 # ---------------------------------------------------------------- context ----
 def _merge(base: dict, over: dict) -> dict:
     """Shallow-merge two config dicts, merging nested dicts one level deep."""
@@ -125,12 +188,12 @@ class Ctx:
 
     Two locations matter:
       root  the Vivado project (sources, .xpr, .bd). Treated as READ-ONLY: bdq never writes there.
-      home  the work directory chosen by the user (holds bdq.json, graphs, notes). The ONLY place
-            bdq writes to; every write goes through assert_writable().
+      home  the work directory chosen by the user (holds bdq.json, graphs, notes). The only place
+            bdq writes to (every write goes through assert_writable()), apart from the registry.
     """
 
     def __init__(self, args, need_graph: bool = True):
-        self.cfg_file = self._locate_config(args)
+        self.cfg_file, self.cfg_source = self._locate_config(args)
         exists = bool(self.cfg_file and self.cfg_file.exists())
         self.raw = load_json(self.cfg_file) if exists else {}
         if not isinstance(self.raw, dict):
@@ -168,6 +231,9 @@ class Ctx:
             g = next((c for c in GRAPH_CANDIDATES if (self.base / c).exists()), "graphs/bd_graph.json")
         self.graph_rel = g
         self.graph_path = (self.base / g).resolve()
+        if need_graph and not exists and not getattr(args, "graph", None) and not os.environ.get("BDQ_GRAPH"):
+            die(f"no configuration found for {self.root} (not registered, no bdq.json): first setup needed "
+                "(`bdq --workdir DIR --project-root PROJECT export ... --save`), or pass --config")
         if need_graph and not self.graph_path.exists():
             die(f"graph not found: {self.graph_path}. Run `bdq export` (or bd_export.tcl in Vivado)")
         self.src_roots = [(self.root / r).resolve() for r in self.cfg.get("src_roots", ["."])]
@@ -177,17 +243,22 @@ class Ctx:
 
     @staticmethod
     def _locate_config(args):
+        """(config file or None, how it was found)."""
         if getattr(args, "config", None):
-            return Path(args.config).expanduser().resolve()
+            return Path(args.config).expanduser().resolve(), "--config"
         if getattr(args, "workdir", None):
-            return (Path(args.workdir).expanduser() / CONFIG_NAME).resolve()
+            return (Path(args.workdir).expanduser() / CONFIG_NAME).resolve(), "--workdir"
         if os.environ.get("BDQ_CONFIG"):
-            return Path(os.environ["BDQ_CONFIG"]).expanduser().resolve()
+            return Path(os.environ["BDQ_CONFIG"]).expanduser().resolve(), "BDQ_CONFIG"
+        start = Path(args.project_root).expanduser() if getattr(args, "project_root", None) else Path.cwd()
+        hit = registry_lookup(start)
+        if hit:
+            return Path(hit[1]).resolve(), f"registry ({registry_path()})"
         cwd = Path.cwd()
         for d in (cwd, *cwd.parents):
             if (d / CONFIG_NAME).exists():
-                return (d / CONFIG_NAME).resolve()
-        return None
+                return (d / CONFIG_NAME).resolve(), "found upwards from the current directory"
+        return None, None
 
     @staticmethod
     def _cli_overrides(args) -> dict:
@@ -972,17 +1043,69 @@ def cmd_outline(d: Design, ctx: Ctx, a) -> None:
     print("next: read only the line ranges that answer the question (Read with offset/limit)")
 
 
+def _note_sources(d: Design, ctx: Ctx, p: str, extra=()) -> str:
+    """`file@sha1 ...` for the block's own source (handwritten preferred) plus extra project files."""
+    _, hits, _ = find_sources(d, ctx, p) if p in d.cells else (None, [], [])
+    files = [f for f, _, _ in ([h for h in hits if not h[1]] or hits)]
+    for x in extra:
+        f = (ctx.root / x).resolve()
+        if not f.is_file():
+            die(f"--source {x}: no such file under the project root {ctx.root}")
+        if f not in files:
+            files.append(f)
+    return " ".join(f"{ctx.rel(f)}@{sha(f)}" for f in files)
+
+
+def _set_note(d: Design, ctx: Ctx, p: str, body: str, extra=()) -> None:
+    """Write the section for block p: replace an existing one (and drop duplicates) or append it.
+    The header and the sources line are generated here; body is the Role line plus bullets."""
+    lines = [l for l in body.strip().splitlines()
+             if not re.match(r"^\s*<!--\s*sources:", l) and not re.match(r"^##\s+" + re.escape(p) + r"\s*$", l)]
+    body = "\n".join(lines).strip()
+    if NOTE_HDR.search(body):
+        die("the note body must not contain other '## /...' headers")
+    if not re.search(r"^\s*(?:\*\*)?Role(?:\*\*)?:\s*\S", body, re.M):
+        die("the note body needs a 'Role: <one line>' line (shown by bdq overview)")
+    srcs = _note_sources(d, ctx, p, extra)
+    section = f"## {p}\n" + (f"<!-- sources: {srcs} -->\n" if srcs else "") + body + "\n\n"
+
+    path = ctx.assert_writable(ctx.notes_path)
+    text = path.read_text(errors="ignore") if path.exists() else "# Design notes\n\n"
+    heads = list(NOTE_HDR.finditer(text))
+    spans = [(m.start(), heads[i + 1].start() if i + 1 < len(heads) else len(text))
+             for i, m in enumerate(heads) if m.group(1) == p]
+    if spans:
+        out, pos = [], 0
+        for k, (a0, b0) in enumerate(spans):
+            out.append(text[pos:a0])
+            if k == 0:
+                out.append(section)
+            pos = b0
+        text = "".join(out) + text[pos:]
+    else:
+        text = text.rstrip("\n") + "\n\n" + section
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text.rstrip("\n") + "\n")
+    tmp.replace(path)
+    print(f"note {'updated' if spans else 'added'}: {short(p)} in {ctx.rel(path)}"
+          + (f"  (sources: {srcs})" if srcs else "  (no sources: unversioned)"))
+
+
 def cmd_notes(d: Design, ctx: Ctx, a) -> None:
     notes = load_notes(ctx)
+    if a.set and not a.name:
+        die("--set needs a block name: bdq notes NAME --set < note.md")
     if a.name:
         p = d.resolve(a.name)
+        if a.set:
+            _set_note(d, ctx, p, sys.stdin.read(), a.source or ())
+            return
         if a.template:
-            _, hits, _ = find_sources(d, ctx, p) if p in d.cells else (None, [], [])
-            use = [h for h in hits if not h[1]] or hits
-            srcs = " ".join(f"{ctx.rel(f)}@{sha(f)}" for f, _, _ in use)
+            srcs = _note_sources(d, ctx, p, a.source or ())
             if p in notes:
-                print(f"bdq: {ctx.rel(ctx.notes_path)} already has a section for {p}: replace it, do not append",
-                      file=sys.stderr)
+                print(f"bdq: {ctx.rel(ctx.notes_path)} already has a section for {p}; "
+                      "`bdq notes NAME --set` replaces it", file=sys.stderr)
             print(f"## {p}")
             if srcs:
                 print(f"<!-- sources: {srcs} -->")
@@ -1099,13 +1222,27 @@ def _save_profile(ctx: Ctx, name: str) -> None:
     raw.setdefault("profiles", {})[name] = prof
     raw.setdefault("default_profile", name)
     cfg_file.parent.mkdir(parents=True, exist_ok=True)
-    cfg_file.write_text(json.dumps(raw, indent=2) + "\n")
+    tmp = cfg_file.with_name(cfg_file.name + ".tmp")
+    tmp.write_text(json.dumps(raw, indent=2) + "\n")
+    tmp.replace(cfg_file)
     print(f"saved profile '{name}' in {cfg_file}" + (" (default)" if raw["default_profile"] == name else ""))
+    if not ctx.legacy:
+        registry_set(ctx.root, cfg_file)   # later runs inside the project find this config by themselves
 
 
 def cmd_config(ctx: Ctx, a) -> None:
+    exists = bool(ctx.cfg_file and ctx.cfg_file.exists())
+    if a.register or a.unregister:
+        if not exists:
+            die("no bdq.json to register: run the first export with --save, or pass --config")
+        if ctx.legacy:
+            die("the work directory is the project root or contains it: move bdq.json to a dedicated "
+                "folder before registering")
+        registry_set(ctx.root, None if a.unregister else ctx.cfg_file)
+        return
     profiles = ctx.raw.get("profiles") or {}
-    print(f"config: {ctx.cfg_file if ctx.cfg_file and ctx.cfg_file.exists() else '(no bdq.json)'}")
+    print(f"config: {ctx.cfg_file if exists else '(no bdq.json)'}"
+          + (f"  [{ctx.cfg_source}]" if exists and ctx.cfg_source else ""))
     print(f"workdir (only writable place): {ctx.home or '(none: pass --workdir)'}")
     print(f"project (read-only): {ctx.root}")
     if ctx.legacy:
@@ -1120,6 +1257,12 @@ def cmd_config(ctx: Ctx, a) -> None:
     print(f"src_roots: {', '.join(ctx.rel(r) for r in ctx.src_roots)}")
     print(f"notes: {ctx.rel(ctx.notes_path)}")
     print(f"confirm_before_export: {bool(ctx.raw.get('confirm_before_export'))}")
+    reg = load_registry().get(str(ctx.root))
+    if exists and reg == str(ctx.cfg_file):
+        print(f"registry: project registered ({registry_path()})")
+    elif exists:
+        print("registry: project not registered" + (f" (registered to {reg})" if reg else "")
+              + " -> `bdq config --register` lets bdq find this config from inside the project")
 
 
 def cmd_discover(ctx: Ctx, a) -> None:
@@ -1157,7 +1300,7 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="bdq", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--graph", help="path to bd_graph.json (default: profile / bdq.json / BDQ_GRAPH / auto)")
     ap.add_argument("--profile", help="named profile from bdq.json (default: BDQ_PROFILE or default_profile)")
-    ap.add_argument("--config", help="path to bdq.json (default: --workdir, BDQ_CONFIG, or search upwards)")
+    ap.add_argument("--config", help="path to bdq.json (default: --workdir, BDQ_CONFIG, the project registry, or search upwards)")
     ap.add_argument("--workdir", help="work directory holding bdq.json, graphs and notes (the only writable place)")
     ap.add_argument("--project-root", dest="project_root", help="Vivado project root (read-only); saved in bdq.json")
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -1171,6 +1314,10 @@ def main(argv=None) -> None:
     s = sp.add_parser("src"); s.add_argument("name")
     s = sp.add_parser("outline"); s.add_argument("name"); s.add_argument("--max", type=int, default=60)
     s = sp.add_parser("notes"); s.add_argument("name", nargs="?"); s.add_argument("--template", action="store_true")
+    s.add_argument("--set", action="store_true", help="write the note for NAME from stdin (Role line + bullets), "
+                   "replacing any existing one; header and sources line are generated")
+    s.add_argument("--source", action="append", metavar="FILE",
+                   help="extra source file (relative to the project root) the note depends on; repeatable")
     s = sp.add_parser("export")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--xpr", help="Vivado project file, relative to the project root")
@@ -1183,6 +1330,8 @@ def main(argv=None) -> None:
     s.add_argument("--save", nargs="?", const=True, metavar="PROFILE",
                    help="save these parameters as a profile in bdq.json (default name: the bd name)")
     s = sp.add_parser("config")
+    s.add_argument("--register", action="store_true", help="map this project root to this bdq.json in the registry")
+    s.add_argument("--unregister", action="store_true", help="remove this project root from the registry")
     s = sp.add_parser("discover"); s.add_argument("--max-depth", type=int, default=6)
     a = ap.parse_args(argv)
     if a.cmd in ("export", "config", "discover"):
