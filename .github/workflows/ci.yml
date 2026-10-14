@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.8 is the minimum bdq.py supports (Python shipped next to older Vivado installs)
+        python: ["3.8", "3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Syntax check
+        run: uv run --no-project --python ${{ matrix.python }} python -m py_compile vivado-bd-analyzer/scripts/bdq.py
+      - name: CLI smoke test
+        run: uv run --no-project --python ${{ matrix.python }} python vivado-bd-analyzer/scripts/bdq.py --help
+      - name: Lint
+        if: matrix.python == '3.12'
+        run: uvx ruff check .
+
+  package:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: zip -r vivado-bd-analyzer.skill vivado-bd-analyzer -x '*__pycache__*'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vivado-bd-analyzer.skill
+          path: vivado-bd-analyzer.skill
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vivado-bd-analyzer.skill
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" vivado-bd-analyzer.skill --repo "$GITHUB_REPOSITORY" --generate-notes

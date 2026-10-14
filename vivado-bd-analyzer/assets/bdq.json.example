@@ -1,0 +1,29 @@
+{
+  "project_root": "/home/you/work/proj",
+  "src_roots": ["src/rtl", "src/hls", "ip_repo"],
+  "confirm_before_export": false,
+  "default_profile": "pkt_proc",
+  "profiles": {
+    "pkt_proc": {
+      "vivado": {
+        "xpr": "proj.xpr",
+        "bd": "pkt_proc",
+        "settings": "/tools/Xilinx/Vivado/2023.2/settings64.sh",
+        "skip_config": "*hbm*"
+      },
+      "graph": "graphs/bd_graph_pkt_proc.json"
+    },
+    "debug": {
+      "vivado": {
+        "xpr": "proj.xpr",
+        "bd": "dbg_bd",
+        "settings": "/tools/Xilinx/Vivado/2023.2/settings64.sh"
+      },
+      "graph": "graphs/dbg_bd.json",
+      "src_roots": ["src/rtl", "debug/rtl"]
+    }
+  },
+  "src_map": {
+    "pe_0/core": ["ip_repo/pe_core/hdl/pe_core_top.sv"]
+  }
+}
